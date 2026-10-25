@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# batconmod - toggle the Lenovo battery charge limit (conservation mode)
+#
+# Usage:
+#   batconmod            flip the current state
+#   batconmod on         limit charging (Long_Life, stops at about 60%)
+#   batconmod off        charge to 100% (Standard)
+#   batconmod status     show the current state, change nothing
+#
+# Works through the battery's charge_types file, which the ideapad_laptop
+# driver provides on recent kernels. Writing to it needs root, so the script
+# uses sudo when it has to (you will be asked for your password).
+
+SCRIPT_NAME="$(basename "$0")"
+PS_DIR="${POWER_SUPPLY_DIR:-/sys/class/power_supply}"
+LIMIT_MODE="Long_Life"   # charge limit ON
+FULL_MODE="Standard"     # charge limit OFF
+
+usage() {
+    echo "Usage: $SCRIPT_NAME [toggle|on|off|status]"
+}
+
+die() {
+    echo "$SCRIPT_NAME: error: $*" >&2
+    exit 1
+}
+
+# 1. Check the argument
+ACTION="${1:-toggle}"
+case "$ACTION" in
+    toggle|on|off|status) ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
+esac
+
+# 2. Find the battery's charge_types file
+CT_FILE=""
+for f in "$PS_DIR"/BAT*/charge_types; do
+    if [ -e "$f" ]; then
+        CT_FILE="$f"
+        break
+    fi
+done
+[ -n "$CT_FILE" ] || die "no battery with a charge_types file found in $PS_DIR (is the ideapad_laptop driver loaded?)"
+
+# 3. Make sure both modes we need are offered by this battery
+RAW="$(cat "$CT_FILE")"
+for m in "$LIMIT_MODE" "$FULL_MODE"; do
+    grep -qw "$m" <<< "$RAW" || die "this battery does not list '$m' in charge_types (it lists: $RAW)"
+done
+
+# The active mode is the one in [brackets], e.g. "Fast [Standard] Long_Life"
+get_mode() {
+    local raw sel
+    raw="$(cat "$CT_FILE")"
+    sel="$(grep -o '\[[^]]*\]' <<< "$raw" | tr -d '[]')"
+    echo "${sel:-$raw}"
+}
+
+describe() {
+    case "$1" in
+        "$LIMIT_MODE") echo "Charge limit is ON  ($1: charging stops at about 60%)" ;;
+        "$FULL_MODE")  echo "Charge limit is OFF ($1: charges to 100%)" ;;
+        *)             echo "Charge mode is: $1" ;;
+    esac
+}
+
+CURRENT="$(get_mode)"
+
+# 4. Status only
+if [ "$ACTION" = "status" ]; then
+    describe "$CURRENT"
+    exit 0
+fi
+
+# 5. Work out the target mode
+case "$ACTION" in
+    on)  TARGET="$LIMIT_MODE" ;;
+    off) TARGET="$FULL_MODE" ;;
+    toggle)
+        if [ "$CURRENT" = "$LIMIT_MODE" ]; then
+            TARGET="$FULL_MODE"
+        else
+            TARGET="$LIMIT_MODE"
+        fi
+        ;;
+esac
+
+if [ "$CURRENT" = "$TARGET" ]; then
+    describe "$CURRENT"
+    echo "(already set, nothing changed)"
+    exit 0
+fi
+
+# 6. Warn if TLP is configured to manage this setting itself
+if grep -rqsE '^[[:space:]]*STOP_CHARGE_THRESH_BAT0=' /etc/tlp.conf /etc/tlp.d 2>/dev/null; then
+    echo "Note: STOP_CHARGE_THRESH_BAT0 is set in your TLP config." >&2
+    echo "      TLP re-applies it whenever it runs, which can undo this change." >&2
+fi
+
+# 7. Write the new mode (sudo only if the file is not writable by us)
+if [ -w "$CT_FILE" ]; then
+    echo "$TARGET" > "$CT_FILE" || die "could not write to $CT_FILE"
+else
+    echo "$TARGET" | sudo tee "$CT_FILE" > /dev/null || die "could not write to $CT_FILE"
+fi
+
+# 8. Confirm it really changed
+NEW="$(get_mode)"
+[ "$NEW" = "$TARGET" ] || die "tried to set $TARGET, but the battery reports $NEW"
+describe "$NEW"
